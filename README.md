@@ -158,6 +158,28 @@ python -c "from threads_mcp.server import mcp; mcp.run(transport='sse')"   # por
 Per-call overrides: every tool accepts optional `access_token` / `user_id`
 arguments, so one server instance can post for multiple accounts.
 
+## Posting images
+
+The API has **no upload endpoint**. Threads downloads media from a public URL at
+publish time, so a local file must be hosted for the duration of the call. Once
+`threads_publish` returns an id, Meta holds its own copy on its CDN and the
+hosted file is no longer needed.
+
+`scripts/post_image.py` does the whole thing in one step — it uploads via
+catbox.moe (no account), confirms Threads can fetch the URL, then publishes:
+
+```bash
+python scripts/post_image.py shot.png --text "the pig found a camera"
+python scripts/post_image.py shot.png --no-post   # just host it, print the URL
+```
+
+Limits enforced by the API: **JPEG or PNG only** (not webp/GIF/HEIC), max
+**8 MB**, width 320–1440 px (auto-scaled), aspect ratio max 10:1. Video must be
+MOV/MP4 with no edit lists and the `moov` atom first, max 5 min and 1 GB.
+Carousels take 2–20 items; create each slide with `threads_create_carousel_item`
+using `is_carousel_item` and `media_type` of `IMAGE` or `VIDEO`, then assemble
+with `threads_publish_carousel`.
+
 ## Example agent prompts once connected
 
 - "Check whether the Threads MCP is configured."
