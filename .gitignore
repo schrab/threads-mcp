@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+threads_mcp_project.zip
+.env
+node_modules/
+.next/
+dist/
+build/
+*.log
