@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
-"""One-time helper to mint a long-lived Threads token and print env exports.
+"""One-time helper for the full OAuth redirect flow.
+
+Only needed to authorize non-tester accounts. For your own account, prefer the
+dashboard's user-token generator (README section 1) — it issues a long-lived
+token directly and needs none of this.
 
 Usage:
-    python scripts/setup_token.py --client-id <APP_ID> --client-secret <APP_SECRET> \
-        --code <oauth_code> [--redirect-uri <uri>]
+    python scripts/setup_token.py --client-id <THREADS_APP_ID> \
+        --client-secret <THREADS_APP_SECRET> --code <oauth_code> \
+        --redirect-uri https://your.host/callback
 
-The OAuth code comes from the Threads OAuth dialog:
-  https://auth.threadapp.com/auth/connect?client_id=<APP_ID>\
-&redirect_uri=<URI>&scope=threads_basic,threads_content_publish,\
-threads_manage_replies,threads_read_replies,threads_manage_insights\&response_type=code
+Use the *Threads* app ID / app secret (Settings -> Basic), not the Meta App
+ID / App secret; Meta issues both and only the Threads pair is the OAuth
+client for this API.
+
+--redirect-uri is required because it must exactly match a URI registered on
+your app, and Threads rejects http:// (including http://localhost/...) with
+"Insecure Login Blocked" 1349187. Host it on https:// and point the
+Authorization Window at it:
+
+  https://threads.net/oauth/authorize?client_id=<THREADS_APP_ID>\
+&redirect_uri=<url-encoded-https-uri>&response_type=code\
+&scope=threads_basic,threads_content_publish
+
+The browser lands on your redirect URI with ?code=...; nothing has to be
+listening there, you can copy the code from the address bar.
 """
 
 import argparse
@@ -30,10 +46,18 @@ def main() -> int:
     p.add_argument("--code", required=True, help="OAuth authorization code")
     p.add_argument(
         "--redirect-uri",
-        default="https://localhost/callback",
-        help="Must match the redirect URI registered on the app",
+        required=True,
+        help="Must exactly match a registered https:// redirect URI on the app",
     )
     args = p.parse_args()
+
+    if not args.redirect_uri.startswith("https://"):
+        print(
+            "[!] --redirect-uri must be https://; Threads rejects http:// "
+            "redirect URIs.",
+            file=sys.stderr,
+        )
+        return 1
 
     # 1. Exchange the code for a short-lived user token
     q = urllib.parse.urlencode(

@@ -37,35 +37,87 @@ Ask your agent things like:
 
 ## 1. Get credentials (one-time)
 
+Meta issues **two** ID/secret pairs for an app. You want the **Threads** pair
+(*Settings → Basic* → *Threads app ID* / *Threads App secret*), not the Meta
+pair — a Threads token signed with the Meta app secret fails with error 452.
+
 1. Go to <https://developers.facebook.com> → **Create App** → use case **Other** →
    app type **Business**, then add the **Threads API** product.
-2. In the Threads API product, register a **redirect URI** and generate an
-   **access token** for your own account (this grants
-   `threads_basic`, `threads_content_publish`, etc.). Or do OAuth manually:
+2. Note the **Threads app ID** and **Threads app secret** under *Settings → Basic*.
+3. Enable the permissions you need under *Use cases → Customize → Access the
+   Threads API → Settings*. `threads_basic` is required; add
+   `threads_content_publish` to post.
+4. **App roles → Roles → Add People → Threads Tester**, add your Threads handle.
+   Then, *from that Threads account*, accept the invite (Threads app →
+   Settings → Account → Website permissions). Both halves are required.
+5. Back in *Use cases → Customize → Access the Threads API → Settings*, scroll to
+   the **user-token generator**, pick your tester account, and generate.
+6. Put the token, your numeric user ID, and the Threads app secret in a `.env`
+   file at the repo root (copy `.env.example`). The server loads it
+   automatically on import; real environment variables take precedence.
 
-   ```
-   https://auth.threadapp.com/auth/connect?client_id=<APP_ID>&redirect_uri=<URI>&response_type=code&scope=threads_basic,threads_content_publish,threads_manage_replies,threads_read_replies,threads_manage_insights
-   ```
-3. Mint a long-lived (60-day) token + user id automatically:
+The generator hands you a **long-lived (60-day) token directly** — there is no
+short-lived → long-lived exchange to perform. Do not run it through
+`th_exchange_token`; doing so fails with error 452.
 
-   ```bash
-   python scripts/setup_token.py --client-id <APP_ID> --client-secret <APP_SECRET> --code <OAUTH_CODE>
-   # prints: export THREADS_USER_ID=... / THREADS_ACCESS_TOKEN=... / THREADS_APP_SECRET=...
-   ```
-4. Put those three values in your environment (copy `.env.example`).
+> **Publishing is not required.** Testers can grant permissions at any time
+> while the app is in Development mode. Publishing plus App Review is only
+> needed to authorize accounts that are *not* testers.
+>
+> **Leave *Settings → Basic → Native or desktop app* off.** This server holds
+> the secret in an env var; that toggle is for apps embedding the secret in a
+> shipped binary, and enabling it makes Meta reject secret-signed calls.
+>
+> **If you need the full OAuth redirect flow** instead (e.g. to authorize
+> non-tester accounts), the redirect URI must be **HTTPS**. Threads rejects
+> `http://` URIs — including `http://localhost/...` — with `Insecure Login
+> Blocked` (1349187) or `Invalid redirect_uri`. Host it somewhere public and
+> pass it via `--redirect-uri`.
 
-> The short-lived token expires in ~1 hour; always exchange it with
-> `grant_type=th_exchange_token` (the script does this for you). Refresh the
-> long-lived token every ≤60 days with `grant_type=th_refresh_token`.
+Refresh the long-lived token every ≤60 days with `grant_type=th_refresh_token`.
+
 
 ## 2. Install
 
 ```bash
 pip install -e .          # installs the `threads-mcp` console script
-# or just: pip install fastmcp httpx pydantic
+# or just: pip install fastmcp httpx pydantic python-dotenv
 ```
 
+### Secrets
+
+Credentials are read from `THREADS_ACCESS_TOKEN`, `THREADS_USER_ID` and
+`THREADS_APP_SECRET`. Resolution order at import time:
+
+1. Real environment variables (what an MCP client injects) — always win.
+2. `.env` in the repo root.
+3. `.env` found by walking up from the current working directory.
+
+`.env` is gitignored, so it is safe to keep real tokens there. Prefer it over
+pasting secrets into a client's JSON config, which is more likely to get
+synced or backed up. `threads_check_config` reports whether each value is set
+without ever echoing it.
+
 ## 3. Wire it into your agent
+
+The server reads `.env` from the repo root on its own, so most clients need no
+credential config at all — just the command and the working directory.
+
+### opencode (`~/.config/opencode/opencode.json`)
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "threads": {
+      "type": "local",
+      "command": ["python", "-m", "threads_mcp.server"],
+      "cwd": "/path/to/this/repo",
+      "enabled": true
+    }
+  }
+}
+```
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
@@ -75,27 +127,27 @@ pip install -e .          # installs the `threads-mcp` console script
     "threads": {
       "command": "python",
       "args": ["-m", "threads_mcp.server"],
-      "cwd": "/path/to/this/repo",
-      "env": {
-        "THREADS_ACCESS_TOKEN": "<long-lived token>",
-        "THREADS_USER_ID": "<numeric id>",
-        "THREADS_APP_SECRET": "<app secret>"
-      }
+      "cwd": "/path/to/this/repo"
     }
   }
 }
 ```
 
-(If installed with `pip install -e .`, use `"command": "threads-mcp"` instead.)
+`cwd` matters unless you `pip install -e .` — an uninstalled package is only
+importable from the directory containing it. If it is installed, use
+`"command": "threads-mcp"` and drop `cwd`.
 
 ### Any other MCP client
 
 The server speaks MCP over **stdio** by default:
 
 ```bash
-export THREADS_ACCESS_TOKEN=... THREADS_USER_ID=... THREADS_APP_SECRET=...
 python -m threads_mcp.server
 ```
+
+To inject credentials from the client instead of `.env`, set
+`THREADS_ACCESS_TOKEN`, `THREADS_USER_ID` and `THREADS_APP_SECRET` in the
+server process's environment — real variables always take precedence.
 
 You can also expose it over HTTP/SSE with FastMCP:
 
@@ -123,8 +175,8 @@ arguments, so one server instance can post for multiple accounts.
 - Polls and quote-posts cannot be created via the API (read-only fields).
 - Publishing is rate-limited (~250 posts/24h per user); video containers need
   polling until `is_finished` — handled automatically by `threads_post_video`.
-- Your app must be approved for the permissions you request; for personal use
-  with a Device app in dev mode, your own test-user account works immediately.
+- Testers can grant any permission while your app is in Development mode;
+  App Review and publishing are only required for non-tester accounts.
 
 ## Development
 

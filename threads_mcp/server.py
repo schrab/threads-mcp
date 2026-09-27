@@ -21,13 +21,22 @@ Token setup (one-time, see README):
 
 
 import os
+from pathlib import Path
 from typing import Annotated, Optional
 
 from pydantic import Field
 
+from dotenv import load_dotenv
+
 from fastmcp import FastMCP
 
 from threads_mcp.api import ThreadsAPIError, ThreadsClient
+
+# MCP clients inject these directly; the repo-root .env is a convenience for
+# running the server by hand. Real environment variables always win, since
+# load_dotenv does not override them.
+_REPO_ENV = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_REPO_ENV if _REPO_ENV.is_file() else None)
 
 mcp = FastMCP(
     name="threads",
