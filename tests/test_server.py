@@ -23,11 +23,21 @@ def handler(request: httpx.Request) -> httpx.Response:
             "url": str(request.url),
             "path": request.url.path,
             "params": dict(request.url.params),
-            "body": request.content.decode() if request.content else "",
+            # multipart uploads carry binary; never let that break the recorder
+            "body": request.content.decode(errors="replace") if request.content else "",
         }
     )
     path = request.url.path
 
+    # image hosting (catbox) — upload + public fetch verification
+    if request.url.host == "catbox.moe":
+        return httpx.Response(200, text="https://files.catbox.moe/test-upload.png")
+    if request.url.host == "files.catbox.moe":
+        return httpx.Response(
+            200,
+            content=b"\x89PNG\r\n\x1a\nfake",
+            headers={"Content-Type": "image/png"},
+        )
     if path.endswith("/threads_profile_id"):
         return httpx.Response(200, json={"threads_profile_id": "17841406385576486"})
     # POST /{user-id}/threads_publish  (publish step)
@@ -176,7 +186,7 @@ async def t_carousel(c):
     ids = [data_of(r1)["id"], data_of(r2)["id"]]
     check("carousel items flagged", "is_carousel_item=true" in CALLS[before]["body"], CALLS[before]["body"])
     res = await c.call_tool(
-        "threads_publish_carousel", {"children_ids": ids, "title": "trip", "text": "my trip"}
+        "threads_publish_carousel", {"children_ids": ids, "text": "my trip"}
     )
     carousel_call = CALLS[-2]
     check("carousel children joined", f"children={ids[0]}%2C{ids[1]}" in carousel_call["body"], carousel_call["body"])
@@ -221,6 +231,57 @@ async def t_status(c):
     check("container status FINISHED", d.get("status") == "FINISHED", d)
 
 
+def _tmp_png(name="t.png"):
+    """Minimal valid PNG so upload_image's format check passes."""
+    import tempfile
+    from pathlib import Path
+    p = Path(tempfile.gettempdir()) / name
+    p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    return str(p)
+
+
+async def t_post_images_single(c):
+    before = len(CALLS)
+    res = await c.call_tool("threads_post_images", {"images": [_tmp_png()], "text": "hi"})
+    calls = CALLS[before:]
+    creates = [x for x in calls if "media_type" in x["body"]]
+    check("post_images: exactly one container created", len(creates) == 1, calls)
+    body = creates[0]["body"] if creates else ""
+    check("post_images: single image -> media_type=IMAGE", "media_type=IMAGE" in body, body)
+    check("post_images: uses hosted url", "files.catbox.moe" in body, body)
+    check("post_images: kind=image", data_of(res).get("kind") == "image", data_of(res))
+
+
+async def t_post_images_carousel(c):
+    before = len(CALLS)
+    res = await c.call_tool(
+        "threads_post_images", {"images": [_tmp_png("a.png"), _tmp_png("b.png")], "text": "hi"}
+    )
+    calls = CALLS[before:]
+    joined = "".join(x["body"] for x in calls)
+    check("post_images: children flagged carousel", "is_carousel_item=true" in joined, joined)
+    check("post_images: parent is CAROUSEL", "media_type=CAROUSEL" in joined, joined)
+    check("post_images: kind=carousel", data_of(res).get("kind") == "carousel", data_of(res))
+
+
+async def t_upload_rejects():
+    from threads_mcp.api import ThreadsAPIError, upload_image
+    ok = False
+    try:
+        await upload_image("/tmp/definitely-not-here.png")
+    except ThreadsAPIError:
+        ok = True
+    check("upload_image rejects missing file", ok)
+
+    bad = os.path.join(os.path.dirname(__file__), "..", "README.md")
+    ok = False
+    try:
+        await upload_image(bad)
+    except ThreadsAPIError as e:
+        ok = "JPEG" in str(e)
+    check("upload_image rejects non-image format", ok)
+
+
 def main():
     async def all_tests(c):
         for fn in (
@@ -235,6 +296,8 @@ def main():
             t_delete,
             t_status,
             t_error_surface,
+            t_post_images_single,
+            t_post_images_carousel,
         ):
             await fn(c)
 
@@ -247,11 +310,13 @@ def main():
                 "threads_post_text", "threads_post_image", "threads_post_video",
                 "threads_reply", "threads_publish_carousel", "threads_list_posts",
                 "threads_get_insights", "threads_delete_post", "threads_check_config",
+                "threads_post_images",
             }
             check("all expected tools registered", required <= names, required - names)
 
     run(all_tests)
     asyncio.run(list_check())
+    asyncio.run(t_upload_rejects())
     # unit test appsecret proof
     import hmac, hashlib
     expected = hmac.new(b"s", b"t", hashlib.sha256).hexdigest()

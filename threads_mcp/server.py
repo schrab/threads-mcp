@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 
 from fastmcp import FastMCP
 
-from threads_mcp.api import ThreadsAPIError, ThreadsClient
+from threads_mcp.api import ThreadsAPIError, ThreadsClient, upload_image
 
 # MCP clients inject these directly; the repo-root .env is a convenience for
 # running the server by hand. Real environment variables always win, since
@@ -187,6 +187,72 @@ async def threads_post_image(
     return _ok(data)
 
 
+@mcp.tool(name="threads_post_images")
+async def threads_post_images(
+    images: Annotated[
+        list[str],
+        Field(
+            description="Local image file paths (JPEG/PNG, max 8MB each). One "
+            "path publishes an image post; 2-20 paths publish a carousel. "
+            "Files are uploaded to a temporary public host automatically."
+        ),
+    ],
+    text: Annotated[
+        Optional[str], Field(description="Caption for the post or carousel.")
+    ] = None,
+    user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
+    access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
+) -> dict:
+    """Upload local image file(s) and publish them to Threads.
+
+    Use this instead of threads_post_image when the images are on local disk
+    rather than already hosted. The files are uploaded to a public host for the
+    duration of the call; Threads keeps its own copy afterwards.
+    """
+    if not images:
+        raise ThreadsAPIError("Provide at least one image path.")
+    if len(images) > 20:
+        raise ThreadsAPIError(
+            f"Carousels accept at most 20 items, got {len(images)}."
+        )
+    client = _client(access_token, user_id)
+
+    urls: list[str] = []
+    for path in images:
+        urls.append(await upload_image(path))
+
+    if len(urls) == 1:
+        created = await client.create_container(
+            media_type="IMAGE", image_url=urls[0], text=text
+        )
+    else:
+        child_ids = []
+        for url in urls:
+            child = await client.create_container(
+                media_type="IMAGE", image_url=url, is_carousel_item=True
+            )
+            await client.wait_for_container(child["id"])
+            child_ids.append(child["id"])
+        created = await client.create_carousel_container(
+            children_ids=child_ids, text=text
+        )
+
+    creation_id = created.get("id")
+    if not creation_id:
+        raise ThreadsAPIError(f"Container creation failed: {created}", body=created)
+    result: dict = {
+        "creation_id": creation_id,
+        "image_urls": urls,
+        "kind": "carousel" if len(urls) > 1 else "image",
+    }
+    result.update(await client.publish_container(creation_id))
+    if result.get("id"):
+        result["permalink"] = (
+            await client.get_thread(result["id"], fields="permalink")
+        ).get("permalink")
+    return _ok(result)
+
+
 @mcp.tool(name="threads_post_video")
 async def threads_post_video(
     video_url: Annotated[
@@ -270,7 +336,6 @@ async def threads_publish_carousel(
             "(2-20 items) created via threads_create_carousel_item."
         ),
     ],
-    title: Annotated[Optional[str], Field(description="Carousel title.")] = None,
     text: Annotated[
         Optional[str], Field(description="Caption text for the carousel post.")
     ] = None,
@@ -282,6 +347,8 @@ async def threads_publish_carousel(
 ) -> dict:
     """Assemble carousel items into a carousel post and (optionally) publish it."""
     client = _client(access_token, user_id)
+    for cid in children_ids:
+        await client.wait_for_container(cid)
     container = await client.create_carousel_container(
         children_ids=children_ids, text=text
     )

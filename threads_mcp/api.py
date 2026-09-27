@@ -9,13 +9,20 @@ THREADS_APP_SECRET is configured (required by Meta for server-side calls).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import mimetypes
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
 GRAPH_BASE = "https://graph.threads.net/v1.0"
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+IMAGE_MIME = {"image/jpeg", "image/png"}
 
 
 class ThreadsAPIError(RuntimeError):
@@ -25,6 +32,46 @@ class ThreadsAPIError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+async def upload_image(path: str) -> str:
+    """Host a local image publicly and return its URL.
+
+    The API downloads media from a public URL, so a local file must be hosted
+    somewhere first. Uses catbox.moe, which needs no account and returns a
+    direct file link. The result is verified fetchable before returning, since
+    a bad URL otherwise only fails once a container call is spent on it.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise ThreadsAPIError(f"No such image file: {p}")
+    if p.stat().st_size > IMAGE_MAX_BYTES:
+        raise ThreadsAPIError(
+            f"{p.name} is {p.stat().st_size} bytes; the API limit is "
+            f"{IMAGE_MAX_BYTES} (8 MB)."
+        )
+    mime = mimetypes.guess_type(p.name)[0]
+    if mime not in IMAGE_MIME:
+        raise ThreadsAPIError(
+            f"Format {mime or 'unknown'} is not accepted. Use JPEG or PNG "
+            f"(webp, GIF and HEIC are rejected)."
+        )
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(
+            CATBOX_UPLOAD_URL,
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (p.name, p.read_bytes(), mime)},
+        )
+    url = r.text.strip()
+    if r.status_code != 200 or not url.startswith("http"):
+        raise ThreadsAPIError(f"Image upload failed: {r.text[:200]}")
+    async with httpx.AsyncClient(timeout=60.0) as c:
+        head = await c.get(url, headers={"User-Agent": "threads-mcp/1.0"})
+    if head.status_code != 200 or not head.content:
+        raise ThreadsAPIError(
+            f"Hosted image is not publicly fetchable (HTTP {head.status_code}): {url}"
+        )
+    return url
 
 
 def _appsecret_proof(app_secret: str, access_token: str) -> str:
@@ -198,6 +245,36 @@ class ThreadsClient:
             container_id,
             params=self._params({"fields": "id,status,error_message"}),
         )
+
+    async def wait_for_container(
+        self, container_id: str, timeout: float = 300.0, interval: float = 5.0
+    ) -> dict:
+        """Poll a container until it reaches a terminal status.
+
+        Terminal statuses are FINISHED, PUBLISHED, ERROR and EXPIRED. A carousel
+        parent rejects children that are still processing ("invalid, do not
+        exist, or have expired"), so each child must be waited on first.
+        """
+        deadline = time.monotonic() + timeout
+        status: dict = {}
+        while True:
+            status = await self.get_container_status(container_id)
+            if status.get("status") in ("FINISHED", "PUBLISHED", "ERROR", "EXPIRED"):
+                break
+            if time.monotonic() >= deadline:
+                raise ThreadsAPIError(
+                    f"Container {container_id} not ready after {timeout:.0f}s: "
+                    f"{status}",
+                    body=status,
+                )
+            await asyncio.sleep(interval)
+        if status.get("status") in ("ERROR", "EXPIRED"):
+            raise ThreadsAPIError(
+                f"Container {container_id} failed: "
+                f"{status.get('error_message') or status.get('status')}",
+                body=status,
+            )
+        return status
 
     async def publish_container(self, creation_id: Optional[str] = None) -> dict:
         uid = self.require_user_id()
