@@ -450,7 +450,7 @@ async def threads_list_posts(
         Field(
             description="Comma-separated fields to return.",
         ),
-    ] = "id,permalink,text,timestamp,media_product,type,is_quote_post",
+    ] = "id,permalink,text,timestamp,media_product_type,media_type,is_quote_post",
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
@@ -466,7 +466,7 @@ async def threads_get_post(
     fields: Annotated[
         str,
         Field(description="Comma-separated fields to fetch."),
-    ] = "id,permalink,text,timestamp,media_product,type,username,backlink",
+    ] = "id,permalink,text,timestamp,media_product_type,media_type,username,link_attachment_url",
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
     """Fetch details of a single Threads post."""

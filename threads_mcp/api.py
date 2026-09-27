@@ -333,7 +333,7 @@ class ThreadsClient:
 
     async def get_threads(
         self,
-        fields: str = "id,permalink,text,timestamp,media_product,type,media_url,thumbnail_url,username,is_quote_post",
+        fields: str = "id,permalink,text,timestamp,media_product_type,media_type,media_url,thumbnail_url,username,is_quote_post",
         limit: int = 25,
         since: Optional[int] = None,
         until: Optional[int] = None,
