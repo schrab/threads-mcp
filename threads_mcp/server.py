@@ -139,14 +139,11 @@ async def threads_post_text(
         Optional[str],
         Field(description="Thread id to reply to (creates a reply in that thread)."),
     ] = None,
-    link_url: Annotated[
+    link_attachment: Annotated[
         Optional[str], Field(description="A link URL attachment for the post.")
     ] = None,
     location_id: Annotated[
         Optional[str], Field(description="Optional Threads location id tag.")
-    ] = None,
-    allow_comments: Annotated[
-        Optional[bool], Field(description="Whether comments are allowed on the post.")
     ] = None,
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
@@ -156,9 +153,8 @@ async def threads_post_text(
     data = await client.create_and_publish(
         text=text,
         reply_to_id=reply_to_id,
-        link_url=link_url,
+        link_attachment=link_attachment,
         location_id=location_id,
-        allow_comments=allow_comments,
     )
     return _ok(data)
 
@@ -176,8 +172,7 @@ async def threads_post_image(
         Optional[str], Field(description="Optional caption text for the image post.")
     ] = None,
     reply_to_id: Annotated[Optional[str], Field(description="Thread id to reply to.")] = None,
-    link_url: Annotated[Optional[str], Field(description="Optional link attachment.")] = None,
-    allow_comments: Annotated[Optional[bool], Field(description="Allow comments?")] = None,
+    link_attachment: Annotated[Optional[str], Field(description="Optional link attachment.")] = None,
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
@@ -187,8 +182,7 @@ async def threads_post_image(
         text=text,
         image_url=image_url,
         reply_to_id=reply_to_id,
-        link_url=link_url,
-        allow_comments=allow_comments,
+        link_attachment=link_attachment,
     )
     return _ok(data)
 
@@ -205,7 +199,6 @@ async def threads_post_video(
         Optional[str], Field(description="Optional caption text for the video post.")
     ] = None,
     reply_to_id: Annotated[Optional[str], Field(description="Thread id to reply to.")] = None,
-    allow_comments: Annotated[Optional[bool], Field(description="Allow comments?")] = None,
     poll_until_publish: Annotated[
         bool,
         Field(
@@ -222,19 +215,26 @@ async def threads_post_video(
     client = _client(access_token, user_id)
     created = await client.create_container(
         media_type="VIDEO", video_url=video_url, text=text,
-        reply_to_id=reply_to_id, allow_comments=allow_comments,
+        reply_to_id=reply_to_id,
     )
     creation_id = created.get("id")
     if not creation_id:
         raise ThreadsAPIError(f"Video container creation failed: {created}")
     result = {"creation_id": creation_id}
     if poll_until_publish:
-        for _ in range(60):  # up to ~5 minutes
+        # Meta's troubleshooting guide: poll once per minute, no more than 5 minutes.
+        status: dict = {}
+        for _ in range(5):
             status = await client.get_container_status(creation_id)
-            if status.get("is_finished"):
+            # Terminal: EXPIRED, ERROR, FINISHED, PUBLISHED
+            if status.get("status") in ("FINISHED", "PUBLISHED", "ERROR", "EXPIRED"):
                 break
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
         result["status"] = status
+        if status.get("status") in ("ERROR", "EXPIRED"):
+            raise ThreadsAPIError(
+                f"Video container did not become publishable: {status}", body=status
+            )
     published = await client.publish_container(creation_id)
     result.update(published)
     return _ok(result)
@@ -283,7 +283,7 @@ async def threads_publish_carousel(
     """Assemble carousel items into a carousel post and (optionally) publish it."""
     client = _client(access_token, user_id)
     container = await client.create_carousel_container(
-        children_ids=children_ids, title=title, text=text
+        children_ids=children_ids, text=text
     )
     creation_id = container.get("id")
     result: dict = {"carousel_creation_id": creation_id}
@@ -320,13 +320,8 @@ async def threads_create_container(
     is_carousel_item: Annotated[
         bool, Field(description="True to create a carousel child item.")
     ] = False,
-    link_url: Annotated[Optional[str], Field(description="Link attachment URL.")] = None,
+    link_attachment: Annotated[Optional[str], Field(description="Link attachment URL.")] = None,
     location_id: Annotated[Optional[str], Field(description="Location tag id.")] = None,
-    ast_disabling_keyword: Annotated[
-        Optional[str],
-        Field(description="Keyword to disable auto-alt-text for this post."),
-    ] = None,
-    allow_comments: Annotated[Optional[bool], Field(description="Allow comments?")] = None,
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
@@ -339,10 +334,8 @@ async def threads_create_container(
         video_url=video_url,
         text=text,
         reply_to_id=reply_to_id,
-        link_url=link_url,
+        link_attachment=link_attachment,
         location_id=location_id,
-        ast_disabling_keyword=ast_disabling_keyword,
-        allow_comments=allow_comments,
     )
     return _ok(data)
 

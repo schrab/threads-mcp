@@ -30,10 +30,11 @@ def handler(request: httpx.Request) -> httpx.Response:
 
     if path.endswith("/threads_profile_id"):
         return httpx.Response(200, json={"threads_profile_id": "17841406385576486"})
-    if path.endswith("/threads_publishing") and request.method == "POST":
-        body = request.content.decode()
-        if "creation_id=" in body:
-            return httpx.Response(200, json={"id": "9001", "status": "OK"})
+    # POST /{user-id}/threads_publish  (publish step)
+    if request.method == "POST" and path.endswith("/threads_publish"):
+        return httpx.Response(200, json={"id": "9001"})
+    # POST /{user-id}/threads  (media container creation)
+    if request.method == "POST" and path.endswith("/threads"):
         return httpx.Response(200, json={"id": "container-123"})
     if "/insights" in path:
         return httpx.Response(
@@ -60,7 +61,7 @@ def handler(request: httpx.Request) -> httpx.Response:
     if "container-123" in path:
         return httpx.Response(
             200,
-            json={"id": "container-123", "status": "FINISHED", "is_finished": True},
+            json={"id": "container-123", "status": "FINISHED"},
         )
     return httpx.Response(200, json={"id": "17841406385576486", "username": "zuck"})
 
@@ -141,6 +142,11 @@ async def t_post_text(c):
     check("container POST has text", "Hello+from+MCP%21" in create_body or "Hello from MCP" in create_body, create_body)
     check("publish uses creation_id", "creation_id=container-123" in calls[1]["body"], calls[1]["body"])
     check("returns published id", d.get("id") == "9001", d)
+    # Endpoints per https://developers.facebook.com/documentation/threads/reference/publishing
+    check("container uses POST /threads", calls[0]["path"].endswith("/threads"), calls[0]["path"])
+    check("publish uses POST /threads_publish", calls[1]["path"].endswith("/threads_publish"), calls[1]["path"])
+    check("media_type is sent (required by API)", "media_type=TEXT" in create_body, create_body)
+    check("no legacy threads_publishing endpoint", "threads_publishing" not in calls[0]["path"] and "threads_publishing" not in calls[1]["path"])
 
 
 async def t_post_image(c):

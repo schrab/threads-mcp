@@ -169,18 +169,16 @@ class ThreadsClient:
         video_url: Optional[str] = None,
         text: Optional[str] = None,
         reply_to_id: Optional[str] = None,
-        carousel_parent_id: Optional[str] = None,
-        link_url: Optional[str] = None,
+        link_attachment: Optional[str] = None,
         location_id: Optional[str] = None,
-        ast_disabling_keyword: Optional[str] = None,
-        allow_comments: Optional[bool] = None,
     ) -> dict:
+        """Create a media container. media_type is required by the API."""
         uid = self.require_user_id()
-        data: dict[str, Any] = {}
+        if not media_type:
+            media_type = "VIDEO" if video_url else "IMAGE" if image_url else "TEXT"
+        data: dict[str, Any] = {"media_type": media_type}
         if is_carousel_item:
             data["is_carousel_item"] = "true"
-        elif media_type:
-            data["media_type"] = media_type
         if image_url:
             data["image_url"] = image_url
         if video_url:
@@ -189,24 +187,16 @@ class ThreadsClient:
             data["text"] = text
         if reply_to_id:
             data["reply_to_id"] = reply_to_id
-        if carousel_parent_id:
-            data["carousel_parent_id"] = carousel_parent_id
-        if link_url:
-            data["link_url"] = link_url
+        if link_attachment:
+            data["link_attachment"] = link_attachment
         if location_id:
             data["location_id"] = location_id
-        if ast_disabling_keyword:
-            data["ast_disabling_keyword"] = ast_disabling_keyword
-        if allow_comments is not None:
-            data["allow_comments"] = "true" if allow_comments else "false"
-        return await self.post(f"{uid}/threads_publishing", data=self._params(data))
+        return await self.post(f"{uid}/threads", data=self._params(data))
 
     async def get_container_status(self, container_id: str) -> dict:
         return await self.get(
             container_id,
-            params=self._params(
-                {"fields": "id,status,error_message,is_finished,published_id"}
-            ),
+            params=self._params({"fields": "id,status,error_message"}),
         )
 
     async def publish_container(self, creation_id: Optional[str] = None) -> dict:
@@ -215,7 +205,7 @@ class ThreadsClient:
         if not cid:
             raise ThreadsAPIError("creation_id is required to publish a container.")
         return await self.post(
-            f"{uid}/threads_publishing", data=self._params({"creation_id": cid})
+            f"{uid}/threads_publish", data=self._params({"creation_id": cid})
         )
 
     # -------------------------------------------------------------- publishing
@@ -226,25 +216,17 @@ class ThreadsClient:
         image_url: Optional[str] = None,
         video_url: Optional[str] = None,
         reply_to_id: Optional[str] = None,
-        link_url: Optional[str] = None,
+        link_attachment: Optional[str] = None,
         location_id: Optional[str] = None,
-        allow_comments: Optional[bool] = None,
     ) -> dict:
         """One-shot convenience: create a text/image/video container and publish it."""
-        media_type = None
-        if video_url:
-            media_type = "VIDEO"
-        elif image_url:
-            media_type = "IMAGE"
         created = await self.create_container(
-            media_type=media_type,
             image_url=image_url,
             video_url=video_url,
             text=text,
             reply_to_id=reply_to_id,
-            link_url=link_url,
+            link_attachment=link_attachment,
             location_id=location_id,
-            allow_comments=allow_comments,
         )
         creation_id = created.get("id")
         if not creation_id:
@@ -259,7 +241,6 @@ class ThreadsClient:
     async def create_carousel_container(
         self,
         children_ids: list[str],
-        title: Optional[str] = None,
         text: Optional[str] = None,
     ) -> dict:
         uid = self.require_user_id()
@@ -267,11 +248,9 @@ class ThreadsClient:
             "media_type": "CAROUSEL",
             "children": ",".join(children_ids),
         }
-        if title:
-            data["title"] = title
         if text is not None:
             data["text"] = text
-        return await self.post(f"{uid}/threads_publishing", data=self._params(data))
+        return await self.post(f"{uid}/threads", data=self._params(data))
 
     # ------------------------------------------------------------------- posts
 
