@@ -4,6 +4,10 @@ import asyncio
 import json
 import os
 import sys
+from base64 import b64decode
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,6 +18,8 @@ import threads_mcp.server as server_mod
 from threads_mcp.api import ThreadsAPIError, _appsecret_proof
 
 CALLS = []
+RESPONSES = {}
+PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC")
 
 
 def handler(request: httpx.Request) -> httpx.Response:
@@ -28,6 +34,8 @@ def handler(request: httpx.Request) -> httpx.Response:
         }
     )
     path = request.url.path
+    if (request.method, path) in RESPONSES:
+        return RESPONSES[request.method, path](request)
 
     # image hosting (catbox) — upload + public fetch verification
     if request.url.host == "catbox.moe":
@@ -231,18 +239,142 @@ async def t_status(c):
     check("container status FINISHED", d.get("status") == "FINISHED", d)
 
 
-def _tmp_png(name="t.png"):
-    """Minimal valid PNG so upload_image's format check passes."""
-    import tempfile
-    from pathlib import Path
-    p = Path(tempfile.gettempdir()) / name
-    p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
-    return str(p)
+def _write_png(directory, name="test.png"):
+    path = Path(directory) / name
+    path.write_bytes(PNG)
+    return str(path)
+
+
+async def _tool_error(c, tool, args):
+    from fastmcp.exceptions import ToolError
+
+    try:
+        await c.call_tool(tool, args)
+    except ToolError as e:
+        return str(e)
+    return ""
+
+
+async def t_post_images_guards(c):
+    with TemporaryDirectory() as directory:
+        good = _write_png(directory)
+        args = {"images": [good]}
+        before = len(CALLS)
+        error = await _tool_error(c, "threads_post_images", args)
+        check("local images require explicit Catbox opt-in", "allow_catbox_upload" in error and len(CALLS) == before)
+
+        args["allow_catbox_upload"] = True
+        for setting in ("THREADS_ACCESS_TOKEN", "THREADS_USER_ID"):
+            with patch.dict(os.environ):
+                del os.environ[setting]
+                before = len(CALLS)
+                error = await _tool_error(c, "threads_post_images", args)
+                check(f"missing {setting} blocks upload", setting in error and len(CALLS) == before)
+
+        bad = Path(directory) / "bad.png"
+        bad.write_bytes(PNG[:20])
+        args["images"] = [good, str(bad)]
+        before = len(CALLS)
+        error = await _tool_error(c, "threads_post_images", args)
+        check("invalid image in batch prevents every upload", "bad.png" in error and len(CALLS) == before)
+
+
+async def t_post_images_permalink_failure(c):
+    with TemporaryDirectory() as directory, patch.dict(RESPONSES, {
+        ("GET", "/v1.0/9001"): lambda _: httpx.Response(503, json={"error": {"message": "Unavailable"}}),
+    }):
+        before = len(CALLS)
+        args = {"images": [_write_png(directory)], "allow_catbox_upload": True}
+        try:
+            d = data_of(await c.call_tool("threads_post_images", args))
+        except Exception:
+            d = {}
+        publishes = [call for call in CALLS[before:] if call["path"].endswith("/threads_publish")]
+        check("published image ID survives a permalink lookup failure", d.get("ok") and d.get("id") == "9001", d)
+        check("permalink lookup failure does not publish again", len(publishes) == 1)
+
+
+async def t_post_video_processing(c):
+    for status, expect_publish, published in (
+        ("IN_PROGRESS", False, False),
+        ("PUBLISHED", False, True),
+        ("FINISHED", True, True),
+    ):
+        with patch.dict(RESPONSES, {
+            ("GET", "/v1.0/container-123"): lambda _: httpx.Response(200, json={"status": status}),
+        }), patch("asyncio.sleep", new_callable=AsyncMock):
+            before = len(CALLS)
+            res = await c.call_tool("threads_post_video", {"video_url": "https://example.com/movie.mp4"})
+            d = data_of(res)
+            did_publish = any(call["path"].endswith("/threads_publish") for call in CALLS[before:])
+            check(f"video {status}: publish call only if ready", did_publish == expect_publish)
+            check(f"video {status}: reports outcome and creation ID", d.get("published") is published and d.get("creation_id") == "container-123", d)
+
+
+async def t_post_video_no_wait(c):
+    with patch.dict(RESPONSES, {
+        ("GET", "/v1.0/container-123"): lambda _: httpx.Response(200, json={"status": "IN_PROGRESS"}),
+    }):
+        before = len(CALLS)
+        res = await c.call_tool("threads_post_video", {
+            "video_url": "https://example.com/movie.mp4", "poll_until_publish": False,
+        })
+        calls = CALLS[before:]
+        check("no-wait video checks status once", sum(call["method"] == "GET" for call in calls) == 1)
+        check("no-wait video does not publish a pending container", not any(
+            call["path"].endswith("/threads_publish") for call in calls
+        ) and data_of(res).get("published") is False)
+
+
+async def t_carousel_limits(c):
+    for count in (0, 1, 21):
+        before = len(CALLS)
+        error = await _tool_error(c, "threads_publish_carousel", {"children_ids": ["container-123"] * count})
+        check(f"carousel with {count} children fails before any requests", "2" in error and "20" in error and len(CALLS) == before)
+
+
+async def t_http_errors():
+    from threads_mcp.api import ThreadsClient
+
+    client = ThreadsClient(access_token="test-token")
+    for verb, response, expected in (
+        ("GET", httpx.Response(503, json={"message": "Unavailable"}), "503"),
+        ("POST", httpx.Response(502, text="Bad Gateway"), "502"),
+        ("DELETE", httpx.Response(403, json={"error": {"message": "Permission denied", "code": 10}}), "code=10"),
+        ("GET", httpx.Response(200, text="Not JSON"), "JSON"),
+    ):
+        with patch.dict(RESPONSES, {(verb, "/v1.0/test"): lambda _: response}):
+            try:
+                await getattr(client, verb.lower())("test")
+            except ThreadsAPIError as e:
+                ok = expected in str(e) and e.status_code == response.status_code
+            except ValueError:
+                ok = False
+            else:
+                ok = False
+        check(f"{verb} HTTP {response.status_code}: surfaces typed API error", ok)
+
+    def timeout(request):
+        raise httpx.ReadTimeout(f"Timed out at {request.url}", request=request)
+
+    with patch.dict(RESPONSES, {("GET", "/v1.0/test"): timeout}):
+        try:
+            await client.get("test", params={"access_token": "test-token"})
+        except ThreadsAPIError as e:
+            ok = "ReadTimeout" in str(e) and "test-token" not in str(e)
+        except httpx.RequestError:
+            ok = False
+        else:
+            ok = False
+    check("transport errors become actionable errors without credentials", ok)
 
 
 async def t_post_images_single(c):
     before = len(CALLS)
-    res = await c.call_tool("threads_post_images", {"images": [_tmp_png()], "text": "hi"})
+    with TemporaryDirectory() as directory:
+        res = await c.call_tool("threads_post_images", {
+            "images": [_write_png(directory)], "text": "hi", "allow_catbox_upload": True,
+        })
     calls = CALLS[before:]
     creates = [x for x in calls if "media_type" in x["body"]]
     check("post_images: exactly one container created", len(creates) == 1, calls)
@@ -254,9 +386,11 @@ async def t_post_images_single(c):
 
 async def t_post_images_carousel(c):
     before = len(CALLS)
-    res = await c.call_tool(
-        "threads_post_images", {"images": [_tmp_png("a.png"), _tmp_png("b.png")], "text": "hi"}
-    )
+    with TemporaryDirectory() as directory:
+        res = await c.call_tool("threads_post_images", {
+            "images": [_write_png(directory, "a.png"), _write_png(directory, "b.png")],
+            "text": "hi", "allow_catbox_upload": True,
+        })
     calls = CALLS[before:]
     joined = "".join(x["body"] for x in calls)
     check("post_images: children flagged carousel", "is_carousel_item=true" in joined, joined)
@@ -296,6 +430,11 @@ def main():
             t_delete,
             t_status,
             t_error_surface,
+            t_post_images_guards,
+            t_post_images_permalink_failure,
+            t_post_video_processing,
+            t_post_video_no_wait,
+            t_carousel_limits,
             t_post_images_single,
             t_post_images_carousel,
         ):
@@ -317,6 +456,7 @@ def main():
     run(all_tests)
     asyncio.run(list_check())
     asyncio.run(t_upload_rejects())
+    asyncio.run(t_http_errors())
     # unit test appsecret proof
     import hmac, hashlib
     expected = hmac.new(b"s", b"t", hashlib.sha256).hexdigest()

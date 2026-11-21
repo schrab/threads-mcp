@@ -12,7 +12,7 @@ Ask your agent things like:
 - *"Make a carousel of these 3 photos"* → `threads_create_carousel_item` × N + `threads_publish_carousel`
 - *"How many views did my last post get?"* → `threads_list_posts` + `threads_get_insights`
 
-## Tools provided (18)
+## Tools provided (19)
 
 | Tool | Purpose |
 |---|---|
@@ -21,12 +21,13 @@ Ask your agent things like:
 | `threads_get_profile` | Fetch profile fields |
 | `threads_post_text` | Publish a text post (one call: create container + publish) |
 | `threads_post_image` | Publish an image post from a public URL |
-| `threads_post_video` | Publish a video post (polls until processing finishes) |
+| `threads_post_images` | Publish local JPEG/PNG files after explicit Catbox opt-in |
+| `threads_post_video` | Publish a ready video or return its pending container ID |
 | `threads_create_carousel_item` | Create one carousel slide container |
 | `threads_publish_carousel` | Assemble + publish a carousel (2–20 items) |
 | `threads_reply` | Reply into an existing thread |
 | `threads_create_container` | Low-level container creation (all publishing params) |
-| `threads_get_container_status` | Poll container status (`FINISHED`/`IN_PROGRESS`/`FAILED`) |
+| `threads_get_container_status` | Check container status (`IN_PROGRESS`, `FINISHED`, `PUBLISHED`, `ERROR`, `EXPIRED`) |
 | `threads_publish` | Publish a finished container |
 | `threads_list_posts` | List your recent posts |
 | `threads_get_post` | Fetch one post's details |
@@ -80,8 +81,7 @@ Refresh the long-lived token every ≤60 days with `grant_type=th_refresh_token`
 ## 2. Install
 
 ```bash
-pip install -e .          # installs the `threads-mcp` console script
-# or just: pip install fastmcp httpx pydantic python-dotenv
+pip install -e .          # installs the `threads-mcp` console script and dependencies
 ```
 
 ### Secrets
@@ -160,25 +160,25 @@ arguments, so one server instance can post for multiple accounts.
 
 ## Posting images
 
-The API has **no upload endpoint**. Threads downloads media from a public URL at
-publish time, so a local file must be hosted for the duration of the call. Once
-`threads_publish` returns an id, Meta holds its own copy on its CDN and the
-hosted file is no longer needed.
+The API fetches media from a public URL. To use local JPEG or PNG files, call
+`threads_post_images` with `allow_catbox_upload: true` only after the user
+approves uploading those files to Catbox. Its public URLs may persist after
+publishing or failure. If the user already hosts the image, use
+`threads_post_image` with its public URL instead.
 
-`scripts/post_image.py` does the whole thing in one step — it uploads via
-catbox.moe (no account), confirms Threads can fetch the URL, then publishes:
+The CLI also requires explicit opt-in:
 
 ```bash
-python scripts/post_image.py shot.png --text "the pig found a camera"
-python scripts/post_image.py shot.png --no-post   # just host it, print the URL
+python scripts/post_image.py shot.png --allow-catbox-upload --text "the pig found a camera"
+python scripts/post_image.py shot.png --allow-catbox-upload --no-post   # host only
 ```
 
-Limits enforced by the API: **JPEG or PNG only** (not webp/GIF/HEIC), max
-**8 MB**, width 320–1440 px (auto-scaled), aspect ratio max 10:1. Video must be
-MOV/MP4 with no edit lists and the `moov` atom first, max 5 min and 1 GB.
-Carousels take 2–20 items; create each slide with `threads_create_carousel_item`
-using `is_carousel_item` and `media_type` of `IMAGE` or `VIDEO`, then assemble
-with `threads_publish_carousel`.
+Images must be **JPEG or PNG**, max **8 MB**. Video must be MOV/MP4 with no
+edit lists and the `moov` atom first, max 5 min and 1 GB. See [Meta's media
+specifications](https://developers.facebook.com/documentation/threads/posts#media-specifications)
+for dimensions and other limits. Carousels take 2–20 items. For public URLs,
+create each slide with `threads_create_carousel_item`, then assemble with
+`threads_publish_carousel`.
 
 ## Example agent prompts once connected
 
@@ -192,11 +192,11 @@ with `threads_publish_carousel`.
 
 - Media must be at **publicly reachable URLs** (the API fetches them; there is no
   file-upload endpoint yet).
-- Text posts support up to 500 characters (API limit); images jpg/png/webp,
-  videos mp4/mov.
+- Text posts support up to 500 characters. Images are JPEG/PNG and videos are MP4/MOV.
 - Polls and quote-posts cannot be created via the API (read-only fields).
-- Publishing is rate-limited (~250 posts/24h per user); video containers need
-  polling until `is_finished` — handled automatically by `threads_post_video`.
+- Publishing is rate-limited (~250 posts/24h per user). `threads_post_video`
+  publishes only when the container is `FINISHED`, or returns a pending
+  `creation_id` to check later.
 - Testers can grant any permission while your app is in Development mode;
   App Review and publishing are only required for non-tester accounts.
 

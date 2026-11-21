@@ -30,7 +30,12 @@ from dotenv import load_dotenv
 
 from fastmcp import FastMCP
 
-from threads_mcp.api import ThreadsAPIError, ThreadsClient, upload_image
+from threads_mcp.api import (
+    ThreadsAPIError,
+    ThreadsClient,
+    read_local_image,
+    upload_validated_image,
+)
 
 # MCP clients inject these directly; the repo-root .env is a convenience for
 # running the server by hand. Real environment variables always win, since
@@ -43,9 +48,11 @@ mcp = FastMCP(
     instructions=(
         "Post and manage content on Threads (threads.net) using the official "
         "Meta Threads API. Use threads_post_text for quick text posts, "
-        "threads_create_and_publish for image/video posts, and the container "
-        "flow (threads_create_container -> threads_publish) for carousels or "
-        "when you need to inspect status before publishing. Identity helpers: "
+        "threads_post_image or threads_post_video for public media URLs, "
+        "and threads_post_images for local JPEG/PNG files only after explicit "
+        "authorization to upload them publicly via Catbox. For staged posts, "
+        "use the container flow (threads_create_container -> threads_publish). "
+        "Identity helpers: "
         "threads_get_user_id resolves a username to a profile id. If a tool "
         "returns an auth/config error, tell the user which environment "
         "variable to set instead of retrying blindly."
@@ -165,7 +172,7 @@ async def threads_post_image(
         str,
         Field(
             description="Publicly accessible URL of the image to post "
-            "(jpg/png/webp, max ~8MB)."
+            "(JPEG/PNG, max 8 MB)."
         ),
     ],
     text: Annotated[
@@ -194,7 +201,7 @@ async def threads_post_images(
         Field(
             description="Local image file paths (JPEG/PNG, max 8MB each). One "
             "path publishes an image post; 2-20 paths publish a carousel. "
-            "Files are uploaded to a temporary public host automatically."
+            "Set allow_catbox_upload only after the user authorizes public hosting."
         ),
     ],
     text: Annotated[
@@ -202,24 +209,26 @@ async def threads_post_images(
     ] = None,
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
+    allow_catbox_upload: Annotated[
+        bool,
+        Field(description="True only with explicit permission to share these files publicly via Catbox."),
+    ] = False,
 ) -> dict:
-    """Upload local image file(s) and publish them to Threads.
-
-    Use this instead of threads_post_image when the images are on local disk
-    rather than already hosted. The files are uploaded to a public host for the
-    duration of the call; Threads keeps its own copy afterwards.
-    """
+    """Upload local images to Catbox and publish to Threads. Public URLs may persist."""
     if not images:
         raise ThreadsAPIError("Provide at least one image path.")
     if len(images) > 20:
         raise ThreadsAPIError(
             f"Carousels accept at most 20 items, got {len(images)}."
         )
+    if not allow_catbox_upload:
+        raise ThreadsAPIError(
+            "Catbox makes local images public. Set allow_catbox_upload=true only with the user's consent."
+        )
     client = _client(access_token, user_id)
-
-    urls: list[str] = []
-    for path in images:
-        urls.append(await upload_image(path))
+    client.require_user_id()
+    validated_images = [read_local_image(path) for path in images]
+    urls = [await upload_validated_image(image) for image in validated_images]
 
     if len(urls) == 1:
         created = await client.create_container(
@@ -247,9 +256,12 @@ async def threads_post_images(
     }
     result.update(await client.publish_container(creation_id))
     if result.get("id"):
-        result["permalink"] = (
-            await client.get_thread(result["id"], fields="permalink")
-        ).get("permalink")
+        try:
+            result["permalink"] = (
+                await client.get_thread(result["id"], fields="permalink")
+            ).get("permalink")
+        except ThreadsAPIError:
+            result["warning"] = "Post published, but its permalink could not be retrieved. Do not retry publishing."
     return _ok(result)
 
 
@@ -268,8 +280,8 @@ async def threads_post_video(
     poll_until_publish: Annotated[
         bool,
         Field(
-            description="Poll container status until the video finishes "
-            "processing before publishing (recommended for videos)."
+            description="Check once, or keep polling until ready when true. "
+            "An unready container is returned without publishing."
         ),
     ] = True,
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
@@ -286,23 +298,25 @@ async def threads_post_video(
     creation_id = created.get("id")
     if not creation_id:
         raise ThreadsAPIError(f"Video container creation failed: {created}")
-    result = {"creation_id": creation_id}
-    if poll_until_publish:
-        # Meta's troubleshooting guide: poll once per minute, no more than 5 minutes.
-        status: dict = {}
-        for _ in range(5):
-            status = await client.get_container_status(creation_id)
-            # Terminal: EXPIRED, ERROR, FINISHED, PUBLISHED
-            if status.get("status") in ("FINISHED", "PUBLISHED", "ERROR", "EXPIRED"):
-                break
+    # Meta recommends checking once per minute, with at most five checks.
+    attempts = 5 if poll_until_publish else 1
+    for attempt in range(attempts):
+        status = await client.get_container_status(creation_id)
+        state = status.get("status")
+        if state in ("FINISHED", "PUBLISHED", "ERROR", "EXPIRED"):
+            break
+        if attempt + 1 < attempts:
             await asyncio.sleep(60)
-        result["status"] = status
-        if status.get("status") in ("ERROR", "EXPIRED"):
-            raise ThreadsAPIError(
-                f"Video container did not become publishable: {status}", body=status
-            )
+    result = {"creation_id": creation_id, "status": status}
+    if state in ("ERROR", "EXPIRED"):
+        raise ThreadsAPIError(
+            f"Video container did not become publishable: {status}", body=status
+        )
+    if state != "FINISHED":
+        return _ok({**result, "published": state == "PUBLISHED"})
     published = await client.publish_container(creation_id)
     result.update(published)
+    result["published"] = bool(published.get("id"))
     return _ok(result)
 
 
@@ -346,6 +360,8 @@ async def threads_publish_carousel(
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
     """Assemble carousel items into a carousel post and (optionally) publish it."""
+    if not 2 <= len(children_ids) <= 20:
+        raise ThreadsAPIError(f"Carousels require 2-20 items, got {len(children_ids)}.")
     client = _client(access_token, user_id)
     for cid in children_ids:
         await client.wait_for_container(cid)
@@ -413,7 +429,7 @@ async def threads_get_container_status(
     user_id: Annotated[str, Field(description="Optional override of the configured value.")] = None,
     access_token: Annotated[str, Field(description="Optional override of the configured value.")] = None,
 ) -> dict:
-    """Check processing status of a publishing container (FINISHED/IN_PROGRESS/FAILED)."""
+    """Check container status: IN_PROGRESS, FINISHED, PUBLISHED, ERROR, or EXPIRED."""
     client = _client(access_token, user_id)
     data = await client.get_container_status(creation_id)
     return _ok(data)
