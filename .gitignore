@@ -8,3 +8,15 @@ dist/
 build/
 *.log
 *.egg-info/
+.venv/
+
+# Local agent instructions and planning notes
+/AGENTS.md
+/SKILL.md
+/skills/pig/
+/.zcodeignore
+/docs/superpowers/
+
+# Paid Agensi companion skill and listing draft
+/skills/threads-mcp/
+/docs/agensi-listing.md

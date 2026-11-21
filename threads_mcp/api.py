@@ -12,17 +12,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import mimetypes
 import time
+from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import httpx
+from PIL import Image
 
 GRAPH_BASE = "https://graph.threads.net/v1.0"
 CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
 IMAGE_MAX_BYTES = 8 * 1024 * 1024
-IMAGE_MIME = {"image/jpeg", "image/png"}
+IMAGE_FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png"}
 
 
 class ThreadsAPIError(RuntimeError):
@@ -34,33 +35,49 @@ class ThreadsAPIError(RuntimeError):
         self.body = body
 
 
-async def upload_image(path: str) -> str:
-    """Host a local image publicly and return its URL.
+class LocalImage(NamedTuple):
+    name: str
+    content: bytes
+    mime: str
 
-    The API downloads media from a public URL, so a local file must be hosted
-    somewhere first. Uses catbox.moe, which needs no account and returns a
-    direct file link. The result is verified fetchable before returning, since
-    a bad URL otherwise only fails once a container call is spent on it.
-    """
+
+def read_local_image(path: str) -> LocalImage:
+    """Validate and snapshot the bytes before they can be sent to a host."""
     p = Path(path).expanduser()
     if not p.is_file():
         raise ThreadsAPIError(f"No such image file: {p}")
-    if p.stat().st_size > IMAGE_MAX_BYTES:
-        raise ThreadsAPIError(
-            f"{p.name} is {p.stat().st_size} bytes; the API limit is "
-            f"{IMAGE_MAX_BYTES} (8 MB)."
-        )
-    mime = mimetypes.guess_type(p.name)[0]
-    if mime not in IMAGE_MIME:
-        raise ThreadsAPIError(
-            f"Format {mime or 'unknown'} is not accepted. Use JPEG or PNG "
-            f"(webp, GIF and HEIC are rejected)."
-        )
+    try:
+        with p.open("rb") as f:
+            content = f.read(IMAGE_MAX_BYTES + 1)
+    except OSError as e:
+        raise ThreadsAPIError(f"Could not read image file: {p.name}") from e
+    if len(content) > IMAGE_MAX_BYTES:
+        raise ThreadsAPIError(f"{p.name} exceeds the 8 MB image limit.")
+
+    try:
+        with Image.open(BytesIO(content), formats=list(IMAGE_FORMATS)) as image:
+            mime = IMAGE_FORMATS[image.format]
+            image.verify()
+        # verify() checks container integrity, but does not decode pixel data.
+        with Image.open(BytesIO(content), formats=list(IMAGE_FORMATS)) as image:
+            image.load()
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as e:
+        raise ThreadsAPIError(f"{p.name} is not a valid JPEG or PNG image.") from e
+    return LocalImage(p.name, content, mime)
+
+
+async def upload_image(path: str) -> str:
+    """Validate a local image and make it available at a public Catbox URL."""
+    return await upload_validated_image(read_local_image(path))
+
+
+async def upload_validated_image(image: LocalImage) -> str:
+    """Upload validated bytes to Catbox and check that the public URL works."""
     async with httpx.AsyncClient(timeout=120.0) as c:
         r = await c.post(
             CATBOX_UPLOAD_URL,
             data={"reqtype": "fileupload"},
-            files={"fileToUpload": (p.name, p.read_bytes(), mime)},
+            files={"fileToUpload": (image.name, image.content, image.mime)},
         )
     url = r.text.strip()
     if r.status_code != 200 or not url.startswith("http"):
@@ -82,8 +99,8 @@ def _appsecret_proof(app_secret: str, access_token: str) -> str:
     ).hexdigest()
 
 
-def _check_payload(payload: dict) -> dict:
-    """Raise a ThreadsAPIError if the Graph API payload contains an error."""
+def _check_payload(payload: Any, status_code: int) -> dict:
+    """Preserve Graph error details and reject unsuccessful HTTP responses."""
     if isinstance(payload, dict) and "error" in payload:
         err = payload["error"]
         if isinstance(err, dict):
@@ -91,11 +108,15 @@ def _check_payload(payload: dict) -> dict:
             code = err.get("code", 0)
             subcode = err.get("error_subcode")
             detail = err.get("error_user_msg") or err.get("error_user_title")
-            full = f"{msg} (code={code}" + (f", subcode={subcode}" if subcode else "") + ")"
+            full = f"{msg} (code={code}" + (f", subcode={subcode})" if subcode else ")")
             if detail:
                 full += f": {detail}"
-            raise ThreadsAPIError(full, body=payload)
-        raise ThreadsAPIError(str(err), body=payload)
+            raise ThreadsAPIError(full, status_code=status_code, body=payload)
+        raise ThreadsAPIError(str(err), status_code=status_code, body=payload)
+    if not 200 <= status_code < 300:
+        raise ThreadsAPIError(f"Threads API returned HTTP {status_code}.", status_code=status_code, body=payload)
+    if not isinstance(payload, dict):
+        raise ThreadsAPIError("Threads API response is not a JSON object.", status_code=status_code, body=payload)
     return payload
 
 
@@ -149,29 +170,31 @@ class ThreadsClient:
 
     # ------------------------------------------------------------- low level
 
-    async def get(self, path: str, params: Optional[dict] = None) -> dict:
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         url = f"{GRAPH_BASE}/{path.lstrip('/')}"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(url, params=params or {})
-        payload = resp.json() if resp.content else {}
-        _check_payload(payload)
-        return payload
+            try:
+                resp = await client.request(method, url, **kwargs)
+            except httpx.RequestError as e:
+                # httpx errors can include the URL, which may carry credentials.
+                raise ThreadsAPIError(f"Threads API request failed ({type(e).__name__}).") from None
+        try:
+            payload = resp.json() if resp.content else {}
+        except ValueError:
+            raise ThreadsAPIError(
+                f"Threads API returned invalid JSON (HTTP {resp.status_code}).",
+                status_code=resp.status_code,
+            ) from None
+        return _check_payload(payload, resp.status_code)
+
+    async def get(self, path: str, params: Optional[dict] = None) -> dict:
+        return await self._request("GET", path, params=params or {})
 
     async def post(self, path: str, data: Optional[dict] = None) -> dict:
-        url = f"{GRAPH_BASE}/{path.lstrip('/')}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, data=data or {})
-        payload = resp.json() if resp.content else {}
-        _check_payload(payload)
-        return payload
+        return await self._request("POST", path, data=data or {})
 
     async def delete(self, path: str, params: Optional[dict] = None) -> dict:
-        url = f"{GRAPH_BASE}/{path.lstrip('/')}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.delete(url, params=params or {})
-        payload = resp.json() if resp.content else {}
-        _check_payload(payload)
-        return payload
+        return await self._request("DELETE", path, params=params or {})
 
     # -------------------------------------------------------------- identity
 
